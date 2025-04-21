@@ -1,4 +1,5 @@
-# here put the import lib
+# -*- coding: utf-8 -*-
+# 设置可见GPU设备（4-7号卡）
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 import json
@@ -6,6 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 
+# 导入LoRA相关模块
 from llm.peft import (
     LoraConfig,
     get_peft_model,
@@ -14,6 +16,8 @@ from llm.peft import (
     set_peft_model_state_dict,
     PeftModel,
 )
+
+# 导入Transformers相关组件
 from transformers import LlamaForCausalLM, LlamaTokenizer, LlamaForSequenceClassification
 from transformers import DataCollatorForSeq2Seq
 from transformers import Trainer, HfArgumentParser, Seq2SeqTrainingArguments
@@ -21,104 +25,101 @@ from transformers import AutoModel, AutoTokenizer
 from transformers import TrainerCallback, TrainerState, TrainerControl, TrainingArguments
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
-from llm.llama import LlamaForMedRec
-from llm.trainer_seq2seq import MedRecTrainer
-from llm.lora_cls import PeftModelForCLS
-from llm.arguments import DataTrainingArguments, ModelArguments
-from llm.data_processor.llama import llama_train_cls, llama_eval_cls
-from llm.data_processor.collator import LongestSequenceCollator
-from generators.data import Voc, EHRTokenizer
-from evaluate import evaluate_jsonlines
+# 导入自定义模块
+from llm.llama import LlamaForMedRec  # 医疗定制版LLaMA
+from llm.trainer_seq2seq import MedRecTrainer  # 定制训练器
+from llm.lora_cls import PeftModelForCLS  # 分类任务适配
+from llm.arguments import DataTrainingArguments, ModelArguments  # 参数配置
+from llm.data_processor.llama import llama_train_cls, llama_eval_cls  # 数据预处理
+from llm.data_processor.collator import LongestSequenceCollator  # 数据批处理
+from generators.data import Voc, EHRTokenizer  # 电子健康记录处理
+from evaluate import evaluate_jsonlines  # 评估指标
 import time
 
-
-# save model for PeftModel
+# 自定义模型保存回调（适配PeftModel）
 class SavePeftModelCallback(TrainerCallback):
-    def on_save(    
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs,
-    ):
-        if state.is_world_process_zero:
-            print('+++++++++++++++++save call back++++++++++++++++')
+    def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        """自定义保存逻辑，避免保存完整模型权重"""
+        if state.is_world_process_zero:  # 主进程执行
+            print('+++++++++++++++++保存检查点回调++++++++++++++++')
             checkpoint_folder = os.path.join(
                 args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
             )
+            # 只保存适配器权重
             kwargs["model"].save_pretrained(checkpoint_folder)
-
+            
+            # 删除自动生成的冗余文件
             pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
             if os.path.exists(pytorch_model_path):
                 os.remove(pytorch_model_path)
             return control
-        
 
 def train():
-
+    # 参数解析（模型参数/数据参数/训练参数）
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    device_map = "auto"
+    device_map = "auto"  # 自动分配GPU设备
 
-    # load diag, proc, med word2id tokenizer
+    # 加载医疗词表（诊断/治疗/药物）
     voc_dir = "data/mimic3/handled/voc_final.pkl"
-    ehr_tokenizer = EHRTokenizer(voc_dir)
+    ehr_tokenizer = EHRTokenizer(voc_dir)  # 包含医疗编码转换功能
 
-    ## Load Model ##
+    # 模型加载 ============================================================
+    print("********************** 加载基础模型 **********************")
+    # 加载医疗定制版LLaMA（扩展了药物分类头）
     model = LlamaForMedRec.from_pretrained(
-        model_args.model_name_or_path,
-        med_voc=len(ehr_tokenizer.med_voc.word2idx),
-    ).half().cuda()
+        pretrained_model_name_or_path=model_args.model_name_or_path,  # LLaMA模型路径
+        med_voc=len(ehr_tokenizer.med_voc.word2idx)  # 药物词表大小
+    ).half().cuda()  # 半精度加载到GPU
 
-    if model_args.peft_path is not None:    # for test model
-        # Resume_training
-        if training_args.resume_from_checkpoint is not None:
+    # LoRA微调配置 =======================================================
+    if model_args.peft_path is not None:  # 测试模式加载现有适配器
+        if training_args.resume_from_checkpoint:  # 恢复训练
             model = PeftModelForCLS.from_pretrained(model, model_args.peft_path, is_trainable=True)
-        else:
+        else:  # 仅推理
             model = PeftModelForCLS.from_pretrained(model, model_args.peft_path, is_trainable=False)
-    else:   # for train model
-        # Load Lora Config
+    else:  # 训练模式初始化LoRA
         peft_config = LoraConfig(
-            r=model_args.lora_rank,
-            lora_alpha=model_args.lora_alpha,
-            target_modules=model_args.trainable.split(","),
-            lora_dropout=model_args.lora_dropout,
-            task_type="SEQ_CLS",
+            r=model_args.lora_rank,          # 低秩矩阵的秩
+            lora_alpha=model_args.lora_alpha, # 缩放系数
+            target_modules=model_args.trainable.split(","),  # 目标模块列表
+            lora_dropout=model_args.lora_dropout,  # 防止过拟合
+            task_type="SEQ_CLS",             # 序列分类任务
         )
+        model = PeftModelForCLS(model, peft_config)  # 包装模型
 
-        model = PeftModelForCLS(model, peft_config)  # LoRA wrapped llama
-
+    # 激活分类头参数（CLS Head）
     if training_args.do_train:
-        for name, param in model.named_parameters():    # activate the CLS head parameters
-            if "cls_head" in name:
+        for name, param in model.named_parameters():
+            if "cls_head" in name:  # 只训练分类头
                 param.requires_grad = True
-    model.print_trainable_parameters()
+    model.print_trainable_parameters()  # 打印可训练参数占比
 
-    ## Load Tokenizer ##
+    # 分词器加载 =========================================================
+    print("********************** 加载分词器 **********************")
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
-        trust_remote_code=True,
+        trust_remote_code=True,  # 信任自定义模型代码
     )
-    tokenizer.pad_token = tokenizer.unk_token
-    tokenizer.padding_side = "right"  # define the padding direction
+    tokenizer.pad_token = tokenizer.unk_token  # 用UNK作为填充符
+    tokenizer.padding_side = "right"  # 右侧填充（适合生成任务）
 
-    ## Load Dataset ##
-    data_files = {}
-    if data_args.train_file is not None:
-        data_files["train"] = data_args.train_file
-    if data_args.validation_file is not None:
-        data_files["validation"] = data_args.validation_file
-    if data_args.test_file is not None:
-        data_files["test"] = data_args.test_file
+    # 数据加载与预处理 ====================================================
+    data_files = {}  # 定义数据路径
+    if data_args.train_file: data_files["train"] = data_args.train_file
+    if data_args.validation_file: data_files["validation"] = data_args.validation_file
+    if data_args.test_file: data_files["test"] = data_args.test_file
 
+    # 加载JSON格式数据集
     raw_datasets = load_dataset(
         "json",
         data_files=data_files,
         cache_dir=model_args.cache_dir,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    print("raw_datasets: ", raw_datasets)
+    print("原始数据集结构:", raw_datasets)
 
+    # 动态选择数据集分割
     if training_args.do_train:
         target_dataset = raw_datasets["train"]
         column_names = raw_datasets["train"].column_names
@@ -127,92 +128,77 @@ def train():
         column_names = raw_datasets["validation"].column_names
     elif training_args.do_predict:
         target_dataset = raw_datasets["test"]
-        # preprocess_func = llama_eval_cls(data_args, model_args, tokenizer, ehr_tokenizer)
         column_names = raw_datasets["test"].column_names
-        # data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, label_pad_token_id=tokenizer.pad_token_id, 
-        #                                        pad_to_multiple_of=None, padding=False)
-    
-    preprocess_func = llama_train_cls(data_args, model_args, tokenizer, ehr_tokenizer)
-    data_collator = LongestSequenceCollator(tokenizer)
 
-    with training_args.main_process_first(desc="Dataset map pre-processing"):
+    # 数据预处理（格式转换）
+    preprocess_func = llama_train_cls(
+        data_args, model_args, tokenizer, ehr_tokenizer  # 输入参数
+    )  # 返回预处理函数
+    data_collator = LongestSequenceCollator(tokenizer)  # 动态填充至批次最大长度
+
+    # 数据集映射预处理函数
+    with training_args.main_process_first(desc="数据集预处理"):
         target_dataset = target_dataset.map(
             preprocess_func,
             batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            desc="Running tokenizer on prediction dataset",
+            num_proc=data_args.preprocessing_num_workers,  # 多进程处理
+            remove_columns=column_names,  # 移除原始列
+            desc="运行分词器处理数据",
         )
-    target_dataset.set_format("torch")
+    target_dataset.set_format("torch")  # 转换为PyTorch张量
 
-    ## Set Trainer ##
+    # 训练器配置 ==========================================================
     trainer = MedRecTrainer(
         model=model,
         args=training_args,
         train_dataset=target_dataset if training_args.do_train else None,
         tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=None,
-        callbacks=([SavePeftModelCallback] if isinstance(model, PeftModel) else None), # substitute the original model saver
+        data_collator=data_collator,  # 自定义数据批处理
+        compute_metrics=None,  # 不使用标准指标
+        callbacks=([SavePeftModelCallback] if isinstance(model, PeftModel) else None),
     )
 
-    ## Train Model
+    # 训练流程 ============================================================
     if training_args.do_train:
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+        checkpoint = training_args.resume_from_checkpoint  # 断点续训
+        model.gradient_checkpointing_enable()  # 激活梯度检查点（节省显存）
+        model.enable_input_require_grads()  # 确保输入张量需要梯度
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_state()
+        trainer.save_state()  # 保存训练状态
 
-    ## Evaluation ##
+    # 模型评估 ============================================================
     results = {}
-
     if training_args.do_predict:
+        # 加载测试数据
         list_test_samples = []
         with open(data_args.test_file, "r", encoding="utf-8") as f:
             for line in f:
-                line = json.loads(line)
-                list_test_samples.append(line)
+                list_test_samples.append(json.loads(line))
 
+        # 执行预测
         start_time = time.time()
         with torch.no_grad():
-            predict_results = trainer.predict(
-                target_dataset,
-                metric_key_prefix="predict",
-                # max_tokens=512,
-                # max_new_tokens=data_args.max_target_length,
-                # do_sample=True,
-                # top_p=0.7,     
-                # temperature=0.95,
-                # repetition_penalty=1.1
-            )
+            predict_results = trainer.predict(target_dataset, metric_key_prefix="predict")
         end_time = time.time()
 
-        if trainer.is_world_process_zero():
+        # 主进程保存结果
+        if trainer.is_world_process_zero:
             predictions = predict_results.predictions
-            assert len(predictions) == len(list_test_samples)
             hidden_states = predict_results.label_ids
 
-            output_prediction_file = os.path.join(training_args.output_dir, "test_predictions.json")
-
-            with open(output_prediction_file, "w", encoding="utf-8") as writer:
+            # 生成预测文件
+            output_file = os.path.join(training_args.output_dir, "test_predictions.json")
+            with open(output_file, "w", encoding="utf-8") as writer:
                 for idx, p in enumerate(predictions):
-                    samp = list_test_samples[idx]
-                    #samp["target"] = ehr_tokenizer.med_voc.idx2word[p]
-                    samp["hidden_states"] = hidden_states[idx].astype(float).tolist()
-                    samp["target"] = p.astype(float).tolist()
-                    res = json.dumps(samp, ensure_ascii=False)
-                    writer.write(f"{res}\n")
+                    sample = list_test_samples[idx]
+                    sample["hidden_states"] = hidden_states[idx].astype(float).tolist()  # 隐藏层状态
+                    sample["target"] = p.astype(float).tolist()  # 预测结果
+                    writer.write(json.dumps(sample, ensure_ascii=False) + "\n")
 
-            results = evaluate_jsonlines(output_prediction_file, ehr_tokenizer)   # output the MedRec metrics
+            # 计算医疗推荐指标
+            results = evaluate_jsonlines(output_file, ehr_tokenizer)
 
     return results
 
-
 if __name__ == "__main__":
-
-    train()
-
-
+    train()  # 启动训练流程
