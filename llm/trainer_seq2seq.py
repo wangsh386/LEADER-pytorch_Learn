@@ -1,40 +1,28 @@
-# Copyright 2020 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# 版权声明：此代码基于Apache License 2.0许可
+# 主要功能：针对序列到序列任务和医疗推荐任务定制的Trainer类
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
 import torch
 from torch import nn
 from torch.utils.data import Dataset
+from transformers import Trainer, TrainingArguments, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.data.data_collator import DataCollator
-
 from transformers.deepspeed import is_deepspeed_zero3_enabled
-from transformers.modeling_utils import PreTrainedModel
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_callback import TrainerCallback
-
 from transformers.trainer_utils import EvalPrediction, PredictionOutput
-from transformers.training_args import TrainingArguments
 from transformers.utils import logging
-
-
-from transformers import Trainer
 
 logger = logging.get_logger(__name__)
 
-
 class Seq2SeqTrainer(Trainer):
+    """继承自Hugging Face Trainer的序列到序列任务专用训练器
+    
+    扩展功能：
+    1. 支持生成式任务的评估和预测
+    2. 自动处理生成参数（如beam search）
+    3. 处理生成结果与标签的对齐
+    """
+
     def evaluate(
         self,
         eval_dataset: Optional[Dataset] = None,
@@ -42,45 +30,30 @@ class Seq2SeqTrainer(Trainer):
         metric_key_prefix: str = "eval",
         **gen_kwargs
     ) -> Dict[str, float]:
+        """扩展评估方法，整合生成参数
+        
+        参数说明：
+        - eval_dataset: 评估数据集，默认为训练器初始化时设定的验证集
+        - ignore_keys: 模型输出中需要忽略的键（如辅助输出）
+        - metric_key_prefix: 评估指标前缀（如'eval'会生成'eval_bleu'等指标）
+        - gen_kwargs: 生成参数（max_length, num_beams等）
+        
+        流程：
+        1. 配置生成参数（优先使用传入参数，其次使用训练参数默认值）
+        2. 调用父类评估方法
         """
-        Run evaluation and returns metrics.
-
-        The calling script will be responsible for providing a method to compute metrics, as they are task-dependent
-        (pass it to the init `compute_metrics` argument).
-
-        You can also subclass and override this method to inject custom behavior.
-
-        Args:
-            eval_dataset (`Dataset`, *optional*):
-                Pass a dataset if you wish to override `self.eval_dataset`. If it is an [`~datasets.Dataset`], columns
-                not accepted by the `model.forward()` method are automatically removed. It must implement the `__len__`
-                method.
-            ignore_keys (`List[str]`, *optional*):
-                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
-                gathering predictions.
-            metric_key_prefix (`str`, *optional*, defaults to `"eval"`):
-                An optional prefix to be used as the metrics key prefix. For example the metrics "bleu" will be named
-                "eval_bleu" if the prefix is `"eval"` (default)
-            max_length (`int`, *optional*):
-                The maximum target length to use when predicting with the generate method.
-            num_beams (`int`, *optional*):
-                Number of beams for beam search that will be used when predicting with the generate method. 1 means no
-                beam search.
-            gen_kwargs:
-                Additional `generate` specific kwargs.
-
-        Returns:
-            A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
-            dictionary also contains the epoch number which comes from the training state.
-        """
-
+        # 生成参数预处理
         gen_kwargs = gen_kwargs.copy()
+        # 设置默认最大生成长度
         if gen_kwargs.get("max_length") is None and gen_kwargs.get("max_new_tokens") is None:
             gen_kwargs["max_length"] = self.args.generation_max_length
+        # 设置默认beam数
         gen_kwargs["num_beams"] = (
-            gen_kwargs["num_beams"] if gen_kwargs.get("num_beams") is not None else self.args.generation_num_beams
+            gen_kwargs["num_beams"] 
+            if gen_kwargs.get("num_beams") is not None 
+            else self.args.generation_num_beams
         )
-        self._gen_kwargs = gen_kwargs
+        self._gen_kwargs = gen_kwargs  # 保存生成参数供后续使用
 
         return super().evaluate(eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
 
@@ -91,54 +64,29 @@ class Seq2SeqTrainer(Trainer):
         metric_key_prefix: str = "test",
         **gen_kwargs
     ) -> PredictionOutput:
+        """预测方法，生成文本结果并计算指标
+        
+        参数说明：
+        - test_dataset: 测试数据集
+        - metric_key_prefix: 测试指标前缀
+        - gen_kwargs: 生成参数
+        
+        返回：
+        PredictionOutput对象包含：
+        - predictions: 模型预测结果（numpy数组）
+        - label_ids: 真实标签（如果数据集包含）
+        - metrics: 评估指标字典
         """
-        Run prediction and returns predictions and potential metrics.
-
-        Depending on the dataset and your use case, your test dataset may contain labels. In that case, this method
-        will also return metrics, like in `evaluate()`.
-
-        Args:
-            test_dataset (`Dataset`):
-                Dataset to run the predictions on. If it is a [`~datasets.Dataset`], columns not accepted by the
-                `model.forward()` method are automatically removed. Has to implement the method `__len__`
-            ignore_keys (`List[str]`, *optional*):
-                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
-                gathering predictions.
-            metric_key_prefix (`str`, *optional*, defaults to `"eval"`):
-                An optional prefix to be used as the metrics key prefix. For example the metrics "bleu" will be named
-                "eval_bleu" if the prefix is `"eval"` (default)
-            max_length (`int`, *optional*):
-                The maximum target length to use when predicting with the generate method.
-            num_beams (`int`, *optional*):
-                Number of beams for beam search that will be used when predicting with the generate method. 1 means no
-                beam search.
-            gen_kwargs:
-                Additional `generate` specific kwargs.
-
-        <Tip>
-
-        If your predictions or labels have different sequence lengths (for instance because you're doing dynamic
-        padding in a token classification task) the predictions will be padded (on the right) to allow for
-        concatenation into one array. The padding index is -100.
-
-        </Tip>
-
-        Returns: *NamedTuple* A namedtuple with the following keys:
-
-            - predictions (`np.ndarray`): The predictions on `test_dataset`.
-            - label_ids (`np.ndarray`, *optional*): The labels (if the dataset contained some).
-            - metrics (`Dict[str, float]`, *optional*): The potential dictionary of metrics (if the dataset contained
-              labels).
-        """
-
+        # 生成参数处理逻辑同evaluate
         gen_kwargs = gen_kwargs.copy()
         if gen_kwargs.get("max_length") is None and gen_kwargs.get("max_new_tokens") is None:
             gen_kwargs["max_length"] = self.args.generation_max_length
         gen_kwargs["num_beams"] = (
-            gen_kwargs["num_beams"] if gen_kwargs.get("num_beams") is not None else self.args.generation_num_beams
+            gen_kwargs["num_beams"] 
+            if gen_kwargs.get("num_beams") is not None 
+            else self.args.generation_num_beams
         )
         self._gen_kwargs = gen_kwargs
-
 
         return super().predict(test_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
 
@@ -149,157 +97,153 @@ class Seq2SeqTrainer(Trainer):
         prediction_loss_only: bool,
         ignore_keys: Optional[List[str]] = None,
     ) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """单步预测核心逻辑
+        
+        参数说明：
+        - model: 当前模型
+        - inputs: 输入张量字典
+        - prediction_loss_only: 是否仅返回loss
+        - ignore_keys: 需要忽略的模型输出键
+        
+        返回：
+        (loss, generated_tokens, labels) 元组
+        
+        流程：
+        1. 准备生成参数
+        2. 调用model.generate生成文本
+        3. 对齐生成结果与标签长度
+        4. 处理特殊设备情况（如DeepSpeed Zero-3）
         """
-        Perform an evaluation step on `model` using `inputs`.
-
-        Subclass and override to inject custom behavior.
-
-        Args:
-            model (`nn.Module`):
-                The model to evaluate.
-            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
-                The inputs and targets of the model.
-
-                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-                argument `labels`. Check your model's documentation for all accepted arguments.
-            prediction_loss_only (`bool`):
-                Whether or not to return the loss only.
-
-        Return:
-            Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss, logits and
-            labels (each being optional).
-        """
-
+        # 如果不需要生成或只需loss，调用父类方法
         if not self.args.predict_with_generate or prediction_loss_only:
-            return super().prediction_step(
-                model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
-            )
+            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
 
         has_labels = "labels" in inputs
-        inputs = self._prepare_inputs(inputs)
+        inputs = self._prepare_inputs(inputs)  # 将输入转移到正确设备
 
-        # XXX: adapt synced_gpus for fairscale as well
+        # 生成参数配置
         gen_kwargs = self._gen_kwargs.copy()
-        if gen_kwargs.get("max_length") is None and gen_kwargs.get("max_new_tokens") is None:
-            gen_kwargs["max_length"] = self.model.config.max_length
-        gen_kwargs["num_beams"] = (
-            gen_kwargs["num_beams"] if gen_kwargs.get("num_beams") is not None else self.model.config.num_beams
-        )
+        # 配置同步GPU参数（DeepSpeed Zero-3特殊处理）
         default_synced_gpus = True if is_deepspeed_zero3_enabled() else False
-        gen_kwargs["synced_gpus"] = (
-            gen_kwargs["synced_gpus"] if gen_kwargs.get("synced_gpus") is not None else default_synced_gpus
-        )
+        gen_kwargs["synced_gpus"] = gen_kwargs.get("synced_gpus", default_synced_gpus)
 
-        if "attention_mask" in inputs:
-            gen_kwargs["attention_mask"] = inputs.get("attention_mask", None)
-        if "position_ids" in inputs:
-            gen_kwargs["position_ids"] = inputs.get("position_ids", None)
-        if "global_attention_mask" in inputs:
-            gen_kwargs["global_attention_mask"] = inputs.get("global_attention_mask", None)
+        # 准备注意力掩码等输入
+        for key in ["attention_mask", "position_ids", "global_attention_mask"]:
+            if key in inputs:
+                gen_kwargs[key] = inputs.get(key)
 
-        # prepare generation inputs
-        # some encoder-decoder models can have varying encoder's and thus
-        # varying model input names
-        if hasattr(self.model, "encoder") and self.model.encoder.main_input_name != self.model.main_input_name:
-            generation_inputs = inputs[self.model.encoder.main_input_name]
+        # 确定生成输入（适配不同encoder-decoder模型）
+        if hasattr(model, "encoder") and model.encoder.main_input_name != model.main_input_name:
+            generation_inputs = inputs[model.encoder.main_input_name]
         else:
-            generation_inputs = inputs[self.model.main_input_name]
+            generation_inputs = inputs[model.main_input_name]
 
+        # 执行生成
         gen_kwargs["input_ids"] = generation_inputs
-        generated_tokens = self.model.generate(**gen_kwargs)
+        generated_tokens = model.generate(**gen_kwargs)
+        
+        # 截断生成结果（移除输入部分）
         generated_tokens = generated_tokens[:, generation_inputs.size()[-1]:]
 
-        # in case the batch is shorter than max length, the output should be padded
-        if gen_kwargs.get("max_length") is not None and generated_tokens.shape[-1] < gen_kwargs["max_length"]:
+        # 填充生成结果到指定长度
+        if gen_kwargs.get("max_length") and generated_tokens.shape[-1] < gen_kwargs["max_length"]:
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_length"])
-        elif gen_kwargs.get("max_new_tokens") is not None and generated_tokens.shape[-1] < (
-            gen_kwargs["max_new_tokens"] + 1
-        ):
-            generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_new_tokens"] + 1)
+        elif gen_kwargs.get("max_new_tokens"):
+            target_length = gen_kwargs["max_new_tokens"] + 1
+            if generated_tokens.shape[-1] < target_length:
+                generated_tokens = self._pad_tensors_to_max_len(generated_tokens, target_length)
 
-        loss = None
-
-        if self.args.prediction_loss_only:
-            return (loss, None, None)
-
+        # 处理标签
+        labels = None
         if has_labels:
             labels = inputs["labels"]
-            if gen_kwargs.get("max_length") is not None and labels.shape[-1] < gen_kwargs["max_length"]:
+            # 对齐标签长度
+            if gen_kwargs.get("max_length") and labels.shape[-1] < gen_kwargs["max_length"]:
                 labels = self._pad_tensors_to_max_len(labels, gen_kwargs["max_length"])
-            elif gen_kwargs.get("max_new_tokens") is not None and labels.shape[-1] < (
-                gen_kwargs["max_new_tokens"] + 1
-            ):
-                labels = self._pad_tensors_to_max_len(labels, (gen_kwargs["max_new_tokens"] + 1))
-        else:
-            labels = None
+            elif gen_kwargs.get("max_new_tokens"):
+                target_length = gen_kwargs["max_new_tokens"] + 1
+                if labels.shape[-1] < target_length:
+                    labels = self._pad_tensors_to_max_len(labels, target_length)
 
-        return (loss, generated_tokens, labels)
+        return (None, generated_tokens, labels)  # loss设为None
 
-    def _pad_tensors_to_max_len(self, tensor, max_length):
-        if self.tokenizer is not None and hasattr(self.tokenizer, "pad_token_id"):
-            # If PAD token is not defined at least EOS token has to be defined
-            pad_token_id = (
-                self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
-            )
-        else:
-            if self.model.config.pad_token_id is not None:
-                pad_token_id = self.model.config.pad_token_id
-            else:
-                raise ValueError("Pad_token_id must be set in the configuration of the model, in order to pad tensors")
-
-        padded_tensor = pad_token_id * torch.ones(
-            (tensor.shape[0], max_length), dtype=tensor.dtype, device=tensor.device
+    def _pad_tensors_to_max_len(self, tensor: torch.Tensor, max_length: int) -> torch.Tensor:
+        """将张量填充到指定长度
+        
+        参数：
+        - tensor: 需要填充的张量 (batch_size, seq_len)
+        - max_length: 目标长度
+        
+        返回：
+        padded_tensor: 填充后的张量 (batch_size, max_length)
+        """
+        # 确定填充token ID
+        pad_token_id = (
+            self.tokenizer.pad_token_id 
+            if self.tokenizer is not None 
+            else self.model.config.pad_token_id
         )
-        padded_tensor[:, : tensor.shape[-1]] = tensor
+        if pad_token_id is None:
+            raise ValueError("需要设置pad_token_id以进行填充")
+
+        # 创建填充模板
+        padded_shape = (tensor.size(0), max_length)
+        padded_tensor = pad_token_id * torch.ones(padded_shape, dtype=tensor.dtype, device=tensor.device)
+        
+        # 复制原始数据
+        padded_tensor[:, : tensor.size(-1)] = tensor
         return padded_tensor
 
 
-
 class MedRecTrainer(Trainer):
-
+    """医疗推荐系统专用训练器
     
-    def prediction_step(self, model: nn.Module, inputs: Dict[str, torch.Tensor], 
-                        prediction_loss_only: bool, ignore_keys: List[str]):
-        """
-        Perform an evaluation step on `model` using `inputs`.
+    功能特点：
+    1. 适配结构化输出（非生成式任务）
+    2. 返回隐藏状态用于后续分析
+    3. 优化内存管理（仅返回必要输出）
+    """
 
-        Subclass and override to inject custom behavior.
-
-        Args:
-            model (`nn.Module`):
-                The model to evaluate.
-            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
-                The inputs and targets of the model.
-
-                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-                argument `labels`. Check your model's documentation for all accepted arguments.
-            prediction_loss_only (`bool`):
-                Whether or not to return the loss only.
-
-        Return:
-            Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss, logits and
-            labels (each being optional).
+    def prediction_step(
+        self, 
+        model: nn.Module, 
+        inputs: Dict[str, torch.Tensor], 
+        prediction_loss_only: bool, 
+        ignore_keys: List[str]
+    ) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """医疗推荐预测步骤
+        
+        参数说明：
+        - model: 医疗推荐模型
+        - inputs: 包含患者病史、用药记录等的输入张量
+        - prediction_loss_only: 是否仅计算损失
+        
+        返回：
+        (loss, logits, hidden_states) 元组
+        
+        流程：
+        1. 准备模型输入
+        2. 获取模型输出（包含隐藏状态）
+        3. 返回关键信息，避免内存溢出
         """
         has_labels = "labels" in inputs
 
-        # Prepare for the inputs
+        # 准备输入
         inputs = self._prepare_inputs(inputs)
-        gen_kwargs = {}
-        if "attention_mask" in inputs:
-            gen_kwargs["attention_mask"] = inputs.get("attention_mask", None)
-        if "position_ids" in inputs:
-            gen_kwargs["position_ids"] = inputs.get("position_ids", None)
-        if "global_attention_mask" in inputs:
-            gen_kwargs["global_attention_mask"] = inputs.get("global_attention_mask", None)
-        gen_kwargs["input_ids"] = inputs[self.model.main_input_name]
-        gen_kwargs["labels"] = inputs["labels"]
+        gen_kwargs = {
+            "attention_mask": inputs.get("attention_mask"),
+            "position_ids": inputs.get("position_ids"),
+            "global_attention_mask": inputs.get("global_attention_mask"),
+            "input_ids": inputs[model.main_input_name],
+            "labels": inputs.get("labels")
+        }
 
-        generated_tokens = self.model(**gen_kwargs)
-        loss = None
-        #labels = None
-        labels = generated_tokens["hidden_states"]
+        # 前向传播
+        outputs = model(**gen_kwargs)
         
-        return (loss, generated_tokens["logits"], labels)   # only pass the logits, otherwise out of memory
+        # 提取关键输出
+        loss = None
+        logits = outputs.get("logits")
+        hidden_states = outputs.get("hidden_states")
 
-
-
+        return (loss, logits, hidden_states)
